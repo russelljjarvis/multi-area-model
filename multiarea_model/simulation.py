@@ -258,6 +258,7 @@ class Simulation:
         """
         self.areas = []
         for area_name in self.areas_simulated:
+            print(area_name)
             a = Area(self, self.network, area_name)
             self.areas.append(a)
 
@@ -361,9 +362,22 @@ class Simulation:
         print("Created cortico-cortical connections in {0:.2f} seconds.".format(
             self.time_network_global))
 
+        if self.params['rebuild_model']:
+            self.model.build()
+            t4 = time.time()
+            self.time_genn_build = t4 - t3
+            print("Built GeNN model in {0:.2f} seconds.".format(self.time_genn_build))
+        else:
+            t4 = t3
+           
+        self.model.load()
+        t5 = time.time()
+        self.time_genn_load = t5 - t4
+        print("Loaded GeNN model in {0:.2f} seconds.".format(self.time_genn_load))
+        
         nest.Simulate(self.T)
-        t4 = time.time()
-        self.time_simulate = t4 - t3
+        t6 = time.time()
+        self.time_simulate = t6 - t5
         print("Simulated network in {0:.2f} seconds.".format(self.time_simulate))
         self.logging()
 
@@ -431,7 +445,7 @@ class Area:
         # area This opens the possibility to have multiple instance of
         # one cortical areas
         if isinstance(other, Area):
-            return self.name == other.name and self.gids == other.gids
+            return self.name == other.name #and self.gids == other.gids
         elif isinstance(other, str):
             return self.name == other
 
@@ -476,10 +490,11 @@ class Area:
             pop_model = lif_model if 'PoissonRate' in pop_lif_params else 'LIF'
             
             # Create GeNN population
-            genn_pop = self.model.add_neuron_population(self.name + '_' + pop, int(self.neuron_numbers[pop]), 
-                                                        pop_model, pop_lif_params, lif_init)
+            genn_pop = self.simulation.model.add_neuron_population(self.name + '_' + pop, 
+                                                                   int(self.neuron_numbers[pop]), 
+                                                                   pop_model, pop_lif_params, lif_init)
             genn_pop.pop.set_spike_location(genn_wrapper.VarLocation_HOST_DEVICE)
-            genn_pops[pop] = genn_pop
+            self.genn_pops[pop] = genn_pop
 
     def connect_populations(self):
         """
@@ -549,24 +564,41 @@ class Area:
                                  syn_spec=syn_spec)
         """
 
-def build_row_lengths(num_pre, num_post, num_connections):
+def build_row_lengths(num_pre, num_post, num_sub_rows, num_connections):
+    assert num_sub_rows > 0
+    
+    num_post_per_sub_row = (num_post + num_sub_rows - 1) // num_sub_rows
+    num_post_remainder = num_post % num_post_per_sub_row
+    
     remaining_connections = num_connections
     matrix_size = num_pre * num_post
     
-    row_lengths = np.empty(num_pre, dtype=np.uint32)
-    for i in range(num_pre - 1):
-        probability = float(num_post) / float(matrix_size)
+    sub_row_lengths = np.empty(num_pre * num_sub_rows, dtype=np.uint32)
+    for i in range(num_pre):
+        last_pre = (i == (num_pre - 1))
         
-        # Sample row length;
-        row_lengths[i] = binom.rvs(remaining_connections, probability)
-        
-        # Update counters
-        remaining_connections -= row_lengths[i]
-        matrix_size -= num_post
+        for j in range(num_sub_rows):
+            last_sub_row = (j == (num_sub_rows - 1))
+            
+            if not last_pre or not last_sub_row:
+                num_sub_row_neurons = (num_post_remainder 
+                                       if num_post_remainder != 0 and last_sub_row 
+                                       else num_post_per_sub_row)
+                
+                probability = float(num_sub_row_neurons) / float(matrix_size)
+                
+                # Sample row length;
+                length = binom.rvs(remaining_connections, probability)
+                
+                # Update counters
+                remaining_connections -= length
+                matrix_size -= num_sub_row_neurons
+                
+                sub_row_lengths[(i * num_sub_rows) + j] = length
         
     # Insert remaining connections into last row
-    row_lengths[num_pre - 1] = remaining_connections
-    return row_lengths
+    sub_row_lengths[-1] = remaining_connections
+    return sub_row_lengths
     
 def connect(simulation,
             target_area,
@@ -583,6 +615,12 @@ def connect(simulation,
     source_area : Area instance
         Source area of the projection
     """
+    num_sub_rows = (simulation.params['num_threads_per_spike'] 
+                    if simulation.params['procedural_connectivity'] 
+                    else 1)
+
+    matrix_type = "PROCEDURAL_PROCEDURALG" if simulation.params['procedural_connectivity']  else "SPARSE_INDIVIDUALG"
+
     network = simulation.network
     synapses = extract_area_dict(network.synapses,
                                  network.structure,
@@ -598,7 +636,8 @@ def connect(simulation,
                              source_area.name)
     for target in target_area.populations:
         for source in source_area.populations:
-            conn_spec = {"total": int(synapses[target][source])}
+            num_connections = int(synapses[target][source])
+            conn_spec = {"total": num_connections}
 
             syn_weight = {"mean": W[target][source], "sd": W_sd[target][source]}
 
@@ -614,6 +653,10 @@ def connect(simulation,
                 s = network.distances[target_area.name][source_area.name]
                 mean_delay = s / v
 
+            exp_curr_params = {
+                "tau": (network.params['neuron_params']['single_neuron_dict']['tau_syn_ex'] if 'E' in source
+                        else network.params['neuron_params']['single_neuron_dict']['tau_syn_in'])}
+            
             syn_delay = {'min': simulation.params['dt'],
                          'max': 10.0,
                          'mean': mean_delay,
@@ -624,15 +667,20 @@ def connect(simulation,
             # Add synapse population
             source_genn_pop = source_area.genn_pops[source]
             target_genn_pop = target_area.genn_pops[target]
-            syn_pop = model.add_synapse_population(synapse_name, "SPARSE_INDIVIDUALG", genn_wrapper.NO_DELAY,
-                source_genn_pop.name, target_genn_pop.name,
+            syn_pop = simulation.model.add_synapse_population(source_genn_pop.name + "_" + target_genn_pop.name, 
+                matrix_type, genn_wrapper.NO_DELAY,
+                source_genn_pop, target_genn_pop,
                 "StaticPulseDendriticDelay", {}, syn_spec, {}, {},
                 "ExpCurr", exp_curr_params, {},
                 genn_model.init_connectivity(fixed_num_total_with_replacement_model, conn_spec))
             
             # Add extra global parameter with row lengths
             syn_pop.add_connectivity_extra_global_param(
-                'preCalcRowLength', build_row_lengths(num_src_neurons, num_trg_neurons, num_connections))
+                'preCalcRowLength', build_row_lengths(source_genn_pop.size, target_genn_pop.size, num_sub_rows, num_connections))
                                            
             # Set max dendritic delay and span type
             syn_pop.pop.set_max_dendritic_delay_timesteps(100)
+            
+            if simulation.params['procedural_connectivity']:
+                syn_pop.pop.set_span_type(genn_wrapper.SynapseGroup.SpanType_PRESYNAPTIC)
+                syn_pop.pop.set_num_threads_per_spike(simulation.params['num_threads_per_spike'])

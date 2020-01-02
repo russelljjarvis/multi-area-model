@@ -49,7 +49,13 @@ sim_params = {
     # Areas represented in the network
     'areas_simulated': complete_area_list,
     # Should GeNN record timings
-    'timing_enabled': True
+    'timing_enabled': True,
+    # Should GeNN use procedural connectivity?
+    'procedural_connectivity': True,
+    # How many threads per spike should GeNN use?
+    'num_threads_per_spike': 1,
+    # Should GeNN rebuild model or use existing code?
+    'rebuild_model': True
 }
 
 """

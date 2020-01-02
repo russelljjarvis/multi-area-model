@@ -43,10 +43,8 @@ sim_params = {'t_sim': 2000.,
 theory_params = {'dt': 0.1}
 
 M = MultiAreaModel(network_params, simulation=True,
-                   sim_spec=sim_params,
-                   theory=True,
-                   theory_spec=theory_params)
-p, r = M.theory.integrate_siegert()
-print("Mean-field theory predicts an average "
-      "rate of {0:.3f} spikes/s across all populations.".format(np.mean(r[:, -1])))
-start_job(M.simulation.label, submit_cmd, jobscript_template)
+                   sim_spec=sim_params)
+#p, r = M.theory.integrate_siegert()
+#print("Mean-field theory predicts an average "
+#      "rate of {0:.3f} spikes/s across all populations.".format(np.mean(r[:, -1])))
+M.simulation.simulate()

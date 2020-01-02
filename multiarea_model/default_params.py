@@ -48,6 +48,8 @@ sim_params = {
     'local_num_threads': 1,
     # Areas represented in the network
     'areas_simulated': complete_area_list,
+    # Should GeNN record timings
+    'timing_enabled': True
 }
 
 """

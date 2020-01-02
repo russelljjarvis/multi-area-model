@@ -16,7 +16,6 @@ is identified by a unique hash label.
 """
 
 import json
-import nest
 import numpy as np
 import os
 import pprint
@@ -29,6 +28,8 @@ from copy import deepcopy
 from .default_params import nested_update, sim_params
 from .default_params import check_custom_params
 from dicthash import dicthash
+from pygenn import genn_model, genn_wrapper
+from scipy.stats import binom, norm
 from .multiarea_helpers import extract_area_dict, create_vector_mask
 try:
     from .sumatra_helpers import register_runtime
@@ -36,6 +37,105 @@ try:
 except ImportError:
     sumatra_found = False
 
+# ----------------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------------
+# LIF neuron model
+lif_model = genn_model.create_custom_neuron_class(
+    "lif",
+    param_names=[
+        "C",                # Membrane capacitance
+        "TauM",             # Membrane time constant [ms]
+        "Vrest",            # Resting membrane potential [mV]
+        "Vreset",           # Reset voltage [mV]
+        "Vthresh",          # Spiking threshold [mV]
+        "Ioffset",          # Offset current
+        "TauRefrac",        # Refractory time [ms]
+        "PoissonRate",      # Poisson input rate [Hz]
+        "PoissonWeight",    # How much current each poisson spike adds [nA]
+        "IpoissonTau"],     # Time constant of poisson spike integration [ms]],
+        
+    var_name_types=[("V","scalar"), ("RefracTime", "scalar"), ("Ipoisson", "scalar")],
+    derived_params=[
+        ("ExpTC",                   genn_model.create_dpf_class(lambda pars, dt: np.exp(-dt / pars[1]))()),
+        ("Rmembrane",               genn_model.create_dpf_class(lambda pars, dt: pars[1] / pars[0])()),
+        ("PoissonExpMinusLambda",   genn_model.create_dpf_class(lambda pars, dt: np.exp(-(pars[7] / 1000.0) * dt))()),
+        ("IpoissonExpDecay",        genn_model.create_dpf_class(lambda pars, dt: np.exp(-dt / pars[9]))()),
+        ("IpoissonInit",            genn_model.create_dpf_class(lambda pars, dt: pars[8] * (1.0 - np.exp(-dt / pars[9])) * (pars[9] / dt))()),
+    ],
+    
+    sim_code="""
+    scalar p = 1.0f;
+    unsigned int numPoissonSpikes = 0;
+    do
+    {
+        numPoissonSpikes++;
+        p *= $(gennrand_uniform);
+    } while (p > $(PoissonExpMinusLambda));
+    $(Ipoisson) += $(IpoissonInit) * (scalar)(numPoissonSpikes - 1);
+    if ($(RefracTime) <= 0.0)
+    {
+      scalar alpha = (($(Isyn) + $(Ioffset) + $(Ipoisson)) * $(Rmembrane)) + $(Vrest);
+      $(V) = alpha - ($(ExpTC) * (alpha - $(V)));
+    }
+    else
+    {
+      $(RefracTime) -= DT;
+    }
+    $(Ipoisson) *= $(IpoissonExpDecay);
+    """,
+    
+    reset_code="""
+    $(V) = $(Vreset);
+    $(RefracTime) = $(TauRefrac);
+    """,
+    threshold_condition_code="$(RefracTime) <= 0.0 && $(V) >= $(Vthresh)")
+
+normal_clipped_model = genn_model.create_custom_init_var_snippet_class(
+    "normal_clipped",
+    param_names=["mean", "sd", "min", "max"],
+    var_init_code="""
+    scalar normal;
+    do
+    {
+       normal = $(mean) + ($(gennrand_normal) * $(sd));
+    } while (normal > $(max) || normal < $(min));
+    $(value) = normal;
+    """)
+
+normal_clipped_delay_model = genn_model.create_custom_init_var_snippet_class(
+    "normal_clipped_delay",
+    param_names=["mean", "sd", "min", "max"],
+    var_init_code="""
+    scalar normal;
+    do
+    {
+       normal = $(mean) + ($(gennrand_normal) * $(sd));
+    } while (normal > $(max) || normal < $(min));
+    $(value) = rint(normal / DT);
+    """)
+    
+fixed_num_total_with_replacement_model = genn_model.create_custom_sparse_connect_init_snippet_class(
+    "fixed_num_total_with_replacement",
+    param_names=["total"],
+    row_build_state_vars=[("x", "scalar", 0.0), ("c", "unsigned int", 0)],
+    extra_global_params=[("preCalcRowLength", "unsigned int*")],
+    calc_max_row_len_func=genn_model.create_cmlf_class(
+        lambda num_pre, num_post, pars: int(binom.ppf(0.9999**(1.0 / num_pre), n=pars[0], p=float(num_post) / (num_pre * num_post))))(),
+    calc_max_col_len_func=genn_model.create_cmlf_class(
+        lambda num_pre, num_post, pars: int(binom.ppf(0.9999**(1.0 / num_post), n=pars[0], p=float(num_pre) / (num_pre * num_post))))(),
+    row_build_code="""
+    const unsigned int rowLength = $(preCalcRowLength)[($(id_pre) * $(num_threads)) + $(id_thread)];
+    if(c >= rowLength) {
+       $(endRow);
+    }
+    const scalar u = $(gennrand_uniform);
+    x += (1.0 - x) * (1.0 - pow(u, 1.0 / (scalar)(rowLength - c)));
+    unsigned int postIdx = (unsigned int)(x * $(num_post));
+    postIdx = (postIdx < $(num_post)) ? postIdx : ($(num_post) - 1);
+    $(addSynapse, postIdx + $(id_post_begin));
+    c++;
+    """)
 
 class Simulation:
     def __init__(self, network, sim_spec):
@@ -144,46 +244,13 @@ class Simulation:
         """
         Prepare NEST Kernel.
         """
-        nest.ResetKernel()
-        master_seed = self.params['master_seed']
-        num_processes = self.params['num_processes']
-        local_num_threads = self.params['local_num_threads']
-        vp = num_processes * local_num_threads
-        nest.SetKernelStatus({'resolution': self.params['dt'],
-                              'total_num_virtual_procs': vp,
-                              'overwrite_files': True,
-                              'data_path': os.path.join(self.data_dir, 'recordings'),
-                              'print_time': False,
-                              'grng_seed': master_seed,
-                              'rng_seeds': list(range(master_seed + 1,
-                                                      master_seed + vp + 1))})
-
-        nest.SetDefaults(self.network.params['neuron_params']['neuron_model'],
-                         self.network.params['neuron_params']['single_neuron_dict'])
-        self.pyrngs = [np.random.RandomState(s) for s in list(range(
-            master_seed + vp + 1, master_seed + 2 * (vp + 1)))]
-
-    def create_recording_devices(self):
-        """
-        Create devices for all populations. Depending on the
-        configuration, this will create:
-        - spike detector
-        - voltmeter
-        """
-        self.spike_detector = nest.Create('spike_detector', 1)
-        status_dict = deepcopy(self.params['recording_dict']['spike_dict'])
-        label = '-'.join((self.label,
-                          status_dict['label']))
-        status_dict.update({'label': label})
-        nest.SetStatus(self.spike_detector, status_dict)
-
-        if self.params['recording_dict']['record_vm']:
-            self.voltmeter = nest.Create('voltmeter')
-            status_dict = self.params['recording_dict']['vm_dict']
-            label = '-'.join((self.label,
-                              status_dict['label']))
-            status_dict.update({'label': label})
-            nest.SetStatus(self.voltmeter, status_dict)
+        self.model = genn_model.GeNNModel("float", "potjans_microcircuit")
+        self.model.dT = self.params['dt']
+        self.model._model.set_merge_postsynaptic_models(True)
+        self.model.timing_enabled = self.params['timing_enabled']
+        self.model.default_var_location = genn_wrapper.VarLocation_DEVICE
+        self.model.default_sparse_connectivity_location = genn_wrapper.VarLocation_DEVICE
+        self.model._model.set_seed(self.params['master_seed'])
 
     def create_areas(self):
         """
@@ -193,7 +260,6 @@ class Simulation:
         for area_name in self.areas_simulated:
             a = Area(self, self.network, area_name)
             self.areas.append(a)
-            print("Memory after {0} : {1:.2f} MB".format(area_name, self.memory() / 1024.))
 
     def cortico_cortical_input(self):
         """
@@ -278,13 +344,11 @@ class Simulation:
         Record used memory and wallclock time.
         """
         t0 = time.time()
-        self.base_memory = self.memory()
         self.prepare()
         t1 = time.time()
         self.time_prepare = t1 - t0
         print("Prepared simulation in {0:.2f} seconds.".format(self.time_prepare))
 
-        self.create_recording_devices()
         self.create_areas()
         t2 = time.time()
         self.time_network_local = t2 - t1
@@ -293,64 +357,15 @@ class Simulation:
 
         self.cortico_cortical_input()
         t3 = time.time()
-        self.network_memory = self.memory()
         self.time_network_global = t3 - t2
         print("Created cortico-cortical connections in {0:.2f} seconds.".format(
             self.time_network_global))
 
-        self.save_network_gids()
-
         nest.Simulate(self.T)
         t4 = time.time()
         self.time_simulate = t4 - t3
-        self.total_memory = self.memory()
         print("Simulated network in {0:.2f} seconds.".format(self.time_simulate))
         self.logging()
-
-    def memory(self):
-        """
-        Use NEST's memory wrapper function to record used memory.
-        """
-        try:
-            mem = nest.ll_api.sli_func('memory_thisjob')
-        except AttributeError:
-            mem = nest.sli_func('memory_thisjob')
-        if isinstance(mem, dict):
-            return mem['heap']
-        else:
-            return mem
-
-    def logging(self):
-        """
-        Write runtime and memory for the first 30 MPI processes
-        to file.
-        """
-        if nest.Rank() < 30:
-            d = {'time_prepare': self.time_prepare,
-                 'time_network_local': self.time_network_local,
-                 'time_network_global': self.time_network_global,
-                 'time_simulate': self.time_simulate,
-                 'base_memory': self.base_memory,
-                 'network_memory': self.network_memory,
-                 'total_memory': self.total_memory}
-            fn = os.path.join(self.data_dir,
-                              'recordings',
-                              '_'.join((self.label,
-                                        'logfile',
-                                        str(nest.Rank()))))
-            with open(fn, 'w') as f:
-                json.dump(d, f)
-
-    def save_network_gids(self):
-        with open(os.path.join(self.data_dir,
-                               'recordings',
-                               'network_gids.txt'), 'w') as f:
-            for area in self.areas:
-                for pop in self.network.structure[area.name]:
-                    f.write("{area},{pop},{g0},{g1}\n".format(area=area.name,
-                                                              pop=pop,
-                                                              g0=area.gids[pop][0],
-                                                              g1=area.gids[pop][1]))
 
     def register_runtime(self):
         if sumatra_found:
@@ -403,11 +418,8 @@ class Area:
             self.external_synapses[pop] = self.network.K[self.name][pop]['external']['external']
 
         self.create_populations()
-        self.connect_devices()
         self.connect_populations()
-        print("Rank {}: created area {} with {} local nodes".format(nest.Rank(),
-                                                                    self.name,
-                                                                    self.num_local_nodes))
+        print("created area {} with {} local nodes".format(self.name, self.num_local_nodes))
 
     def __str__(self):
         s = "Area {} with {} neurons.".format(
@@ -427,47 +439,47 @@ class Area:
         """
         Create all populations of the area.
         """
-        self.gids = {}
+        neuron_params = self.network.params['neuron_params']
+        v_init_params = {"mean": neuron_params['V0_mean'], "sd": neuron_params['V0_sd']}
+        lif_init = {"RefracTime": 0.0, "Ipoisson": 0.0, "V": genn_model.init_var("Normal", v_init_params)}
+        lif_params = {"C": neuron_params['single_neuron_dict']['C_m'] / 1000.0, 
+                      "TauM": neuron_params['single_neuron_dict']['tau_m'], 
+                      "Vrest": neuron_params['single_neuron_dict']['E_L'], 
+                      "Vreset": neuron_params['single_neuron_dict']['V_reset'], 
+                      "Vthresh" : neuron_params['single_neuron_dict']['V_th'],
+                      "TauRefrac": neuron_params['single_neuron_dict']['t_ref']}
+
+        self.genn_pops = {}
         self.num_local_nodes = 0
         for pop in self.populations:
-            gid = nest.Create(self.network.params['neuron_params']['neuron_model'],
-                              int(self.neuron_numbers[pop]))
+            assert neuron_params['neuron_model'] == 'iaf_psc_exp'
+
+            pop_lif_params = deepcopy(lif_params)
+            
             mask = create_vector_mask(self.network.structure, areas=[self.name], pops=[pop])
-            I_e = self.network.add_DC_drive[mask][0]
-            if not self.network.params['input_params']['poisson_input']:
+            pop_lif_params['Ioffset'] = self.network.add_DC_drive[mask][0]
+            if self.network.params['input_params']['poisson_input']:
+                pop_lif_params['PoissonRate'] = self.network.params['input_params']['rate_ext'] * self.external_synapses[pop]
+                pop_lif_params['PoissonWeight'] = self.network.W[self.name][pop]['external']['external']
+                pop_lif_params['IpoissonTau'] = neuron_params['single_neuron_dict']['tau_syn_ex']
+                    
+            else:
                 K_ext = self.external_synapses[pop]
                 W_ext = self.network.W[self.name][pop]['external']['external']
                 tau_syn = self.network.params['neuron_params']['single_neuron_dict']['tau_syn_ex']
                 DC = K_ext * W_ext * tau_syn * 1.e-3 * \
                     self.network.params['rate_ext']
-                I_e += DC
-            nest.SetStatus(gid, {'I_e': I_e})
-
-            # Store first and last GID of each population
-            self.gids[pop] = (gid[0], gid[-1])
-
-            # Initialize membrane potentials
-            # This could also be done after creating all areas, which
-            # might yield better performance. Has to be tested.
-            for t in np.arange(nest.GetKernelStatus('local_num_threads')):
-                local_nodes = np.array(nest.GetNodes(
-                    [0], {
-                        'model': self.network.params['neuron_params']['neuron_model'],
-                        'thread': t
-                    }, local_only=True
-                )[0])
-                local_nodes_pop = local_nodes[(np.logical_and(local_nodes >= gid[0],
-                                                              local_nodes <= gid[-1]))]
-                if len(local_nodes_pop) > 0:
-                    vp = nest.GetStatus([local_nodes_pop[0]], 'vp')[0]
-                    # vp is the same for all local nodes on the same thread
-                    nest.SetStatus(
-                        list(local_nodes_pop), 'V_m', self.simulation.pyrngs[vp].normal(
-                            self.network.params['neuron_params']['V0_mean'],
-                            self.network.params['neuron_params']['V0_sd'],
-                            len(local_nodes_pop))
-                            )
-                    self.num_local_nodes += len(local_nodes_pop)
+                pop_lif_params['Ioffset'] += DC
+            
+            # Use LIF model with Poisson input if poisson noise is used, otherwise standard LIF
+            # **YUCK** really should use Poisson current source here
+            pop_model = lif_model if 'PoissonRate' in pop_lif_params else 'LIF'
+            
+            # Create GeNN population
+            genn_pop = self.model.add_neuron_population(self.name + '_' + pop, int(self.neuron_numbers[pop]), 
+                                                        pop_model, pop_lif_params, lif_init)
+            genn_pop.pop.set_spike_location(genn_wrapper.VarLocation_HOST_DEVICE)
+            genn_pops[pop] = genn_pop
 
     def connect_populations(self):
         """
@@ -476,35 +488,6 @@ class Area:
         connect(self.simulation,
                 self,
                 self)
-
-    def connect_devices(self):
-        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
-            for pop in self.populations:
-                # Always record spikes from all neurons to get correct
-                # statistics
-                nest.Connect(tuple(range(self.gids[pop][0], self.gids[pop][1] + 1)),
-                             self.simulation.spike_detector)
-
-        if self.simulation.params['recording_dict']['record_vm']:
-            for pop in self.populations:
-                nrec = int(self.simulation.params['recording_dict']['Nrec_vm_fraction'] *
-                           self.neuron_numbers[pop])
-                nest.Connect(self.simulation.voltmeter,
-                             tuple(range(self.gids[pop][0], self.gids[pop][0] + nrec + 1)))
-        if self.network.params['input_params']['poisson_input']:
-            self.poisson_generators = []
-            for pop in self.populations:
-                K_ext = self.external_synapses[pop]
-                W_ext = self.network.W[self.name][pop]['external']['external']
-                pg = nest.Create('poisson_generator', 1)
-                nest.SetStatus(
-                    pg, {'rate': self.network.params['input_params']['rate_ext'] * K_ext})
-                syn_spec = {'weight': W_ext}
-                nest.Connect(pg,
-                             tuple(
-                                 range(self.gids[pop][0], self.gids[pop][1] + 1)),
-                             syn_spec=syn_spec)
-                self.poisson_generators.append(pg[0])
 
     def create_additional_input(self, input_type, source_area_name, cc_input):
         """
@@ -524,6 +507,8 @@ class Area:
         cc_input : dict
             Dictionary of cortico-cortical input of the process
             replacing the source area.
+        """
+        assert False
         """
         synapses = extract_area_dict(self.network.synapses,
                                      self.network.structure,
@@ -562,8 +547,27 @@ class Area:
                                  tuple(
                                      range(self.gids[pop][0], self.gids[pop][1] + 1)),
                                  syn_spec=syn_spec)
+        """
 
-
+def build_row_lengths(num_pre, num_post, num_connections):
+    remaining_connections = num_connections
+    matrix_size = num_pre * num_post
+    
+    row_lengths = np.empty(num_pre, dtype=np.uint32)
+    for i in range(num_pre - 1):
+        probability = float(num_post) / float(matrix_size)
+        
+        # Sample row length;
+        row_lengths[i] = binom.rvs(remaining_connections, probability)
+        
+        # Update counters
+        remaining_connections -= row_lengths[i]
+        matrix_size -= num_post
+        
+    # Insert remaining connections into last row
+    row_lengths[num_pre - 1] = remaining_connections
+    return row_lengths
+    
 def connect(simulation,
             target_area,
             source_area):
@@ -594,35 +598,41 @@ def connect(simulation,
                              source_area.name)
     for target in target_area.populations:
         for source in source_area.populations:
-            conn_spec = {'rule': 'fixed_total_number',
-                         'N': int(synapses[target][source])}
+            conn_spec = {"total": int(synapses[target][source])}
 
-            syn_weight = {'distribution': 'normal_clipped',
-                          'mu': W[target][source],
-                          'sigma': W_sd[target][source]}
+            syn_weight = {"mean": W[target][source], "sd": W_sd[target][source]}
+
             if target_area == source_area:
                 if 'E' in source:
-                    syn_weight.update({'low': 0.})
+                    syn_weight.update({'min': 0., 'max': float(np.finfo(np.float32).max)})
                     mean_delay = network.params['delay_params']['delay_e']
                 elif 'I' in source:
-                    syn_weight.update({'high': 0.})
+                    syn_weight.update({'min': float(-np.finfo(np.float32).max), 'max': 0.})
                     mean_delay = network.params['delay_params']['delay_i']
             else:
                 v = network.params['delay_params']['interarea_speed']
                 s = network.distances[target_area.name][source_area.name]
                 mean_delay = s / v
 
-            syn_delay = {'distribution': 'normal_clipped',
-                         'low': simulation.params['dt'],
-                         'mu': mean_delay,
-                         'sigma': mean_delay * network.params['delay_params']['delay_rel']}
-            syn_spec = {'weight': syn_weight,
-                        'delay': syn_delay,
-                        'model': 'static_synapse'}
+            syn_delay = {'min': simulation.params['dt'],
+                         'max': 10.0,
+                         'mean': mean_delay,
+                         'sd': mean_delay * network.params['delay_params']['delay_rel']}
+            syn_spec = {'g': genn_model.init_var(normal_clipped_model, syn_weight),
+                        'd': genn_model.init_var(normal_clipped_delay_model, syn_delay)}
 
-            nest.Connect(tuple(range(source_area.gids[source][0],
-                                     source_area.gids[source][1] + 1)),
-                         tuple(range(target_area.gids[target][0],
-                                     target_area.gids[target][1] + 1)),
-                         conn_spec,
-                         syn_spec)
+            # Add synapse population
+            source_genn_pop = source_area.genn_pops[source]
+            target_genn_pop = target_area.genn_pops[target]
+            syn_pop = model.add_synapse_population(synapse_name, "SPARSE_INDIVIDUALG", genn_wrapper.NO_DELAY,
+                source_genn_pop.name, target_genn_pop.name,
+                "StaticPulseDendriticDelay", {}, syn_spec, {}, {},
+                "ExpCurr", exp_curr_params, {},
+                genn_model.init_connectivity(fixed_num_total_with_replacement_model, conn_spec))
+            
+            # Add extra global parameter with row lengths
+            syn_pop.add_connectivity_extra_global_param(
+                'preCalcRowLength', build_row_lengths(num_src_neurons, num_trg_neurons, num_connections))
+                                           
+            # Set max dendritic delay and span type
+            syn_pop.pop.set_max_dendritic_delay_timesteps(100)

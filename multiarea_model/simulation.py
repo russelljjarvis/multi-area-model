@@ -251,6 +251,28 @@ class Simulation:
         self.model.default_var_location = genn_wrapper.VarLocation_DEVICE
         self.model.default_sparse_connectivity_location = genn_wrapper.VarLocation_DEVICE
         self.model._model.set_seed(self.params['master_seed'])
+        
+        quantile = 0.9999
+        normal_quantile_cdf = norm.ppf(quantile)
+        
+        # Calculate max delay for 
+        ex_delay_sd = self.network.params['delay_params']['delay_e'] * self.network.params['delay_params']['delay_rel']
+        in_delay_sd = self.network.params['delay_params']['delay_i'] * self.network.params['delay_params']['delay_rel']
+        max_ex_delay = self.network.params['delay_params']['delay_e'] + (ex_delay_sd * normal_quantile_cdf)
+        max_in_delay = self.network.params['delay_params']['delay_i'] + (in_delay_sd * normal_quantile_cdf)
+        
+        self.max_inter_area_delay_slots = int(round(max(max_ex_delay, max_in_delay) / self.params['dt']))
+        print("Max inter-area delay slots:%u" % self.max_inter_area_delay_slots)
+        """
+        #
+            
+        #for area_name in self.areas_simulated:
+            
+        else:
+            v = network.params['delay_params']['interarea_speed']
+            s = network.distances[target_area.name][source_area.name]
+            mean_delay = s / v
+        """
 
     def create_areas(self):
         """
@@ -634,33 +656,43 @@ def connect(simulation,
                              network.structure,
                              target_area.name,
                              source_area.name)
+    quantile = 0.9999
+    normal_quantile_cdf = norm.ppf(quantile)
+
     for target in target_area.populations:
         for source in source_area.populations:
             num_connections = int(synapses[target][source])
             conn_spec = {"total": num_connections}
 
             syn_weight = {"mean": W[target][source], "sd": W_sd[target][source]}
-
+            exp_curr_params = {}
+            
             if target_area == source_area:
                 if 'E' in source:
-                    syn_weight.update({'min': 0., 'max': float(np.finfo(np.float32).max)})
                     mean_delay = network.params['delay_params']['delay_e']
                 elif 'I' in source:
-                    syn_weight.update({'min': float(-np.finfo(np.float32).max), 'max': 0.})
                     mean_delay = network.params['delay_params']['delay_i']
             else:
                 v = network.params['delay_params']['interarea_speed']
                 s = network.distances[target_area.name][source_area.name]
                 mean_delay = s / v
-
-            exp_curr_params = {
-                "tau": (network.params['neuron_params']['single_neuron_dict']['tau_syn_ex'] if 'E' in source
-                        else network.params['neuron_params']['single_neuron_dict']['tau_syn_in'])}
+            
+            if 'E' in source:
+                exp_curr_params.update({'tau': network.params['neuron_params']['single_neuron_dict']['tau_syn_ex']})
+                syn_weight.update({'min': 0., 'max': float(np.finfo(np.float32).max)})
+            else:
+                exp_curr_params.update({'tau': network.params['neuron_params']['single_neuron_dict']['tau_syn_in']})
+                syn_weight.update({'min': float(-np.finfo(np.float32).max), 'max': 0.})
+            
+            delay_sd = mean_delay * network.params['delay_params']['delay_rel']
+            max_delay = mean_delay + (delay_sd * normal_quantile_cdf)
+            if max_delay > 10.0:
+                print("ERROR: max delay %f" % max_delay)
             
             syn_delay = {'min': simulation.params['dt'],
                          'max': 10.0,
                          'mean': mean_delay,
-                         'sd': mean_delay * network.params['delay_params']['delay_rel']}
+                         'sd': delay_sd}
             syn_spec = {'g': genn_model.init_var(normal_clipped_model, syn_weight),
                         'd': genn_model.init_var(normal_clipped_delay_model, syn_delay)}
 
@@ -675,8 +707,8 @@ def connect(simulation,
                 genn_model.init_connectivity(fixed_num_total_with_replacement_model, conn_spec))
             
             # Add extra global parameter with row lengths
-            syn_pop.add_connectivity_extra_global_param(
-                'preCalcRowLength', build_row_lengths(source_genn_pop.size, target_genn_pop.size, num_sub_rows, num_connections))
+            #syn_pop.add_connectivity_extra_global_param(
+            #    'preCalcRowLength', build_row_lengths(source_genn_pop.size, target_genn_pop.size, num_sub_rows, num_connections))
                                            
             # Set max dendritic delay and span type
             syn_pop.pop.set_max_dendritic_delay_timesteps(100)

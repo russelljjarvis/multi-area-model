@@ -2,8 +2,6 @@ import numpy as np
 import os
 
 from multiarea_model import MultiAreaModel
-from start_jobs import start_job
-from config import submit_cmd, jobscript_template
 from config import base_path
 
 """

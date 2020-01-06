@@ -51,19 +51,20 @@ lif_model = genn_model.create_custom_neuron_class(
         "Vthresh",          # Spiking threshold [mV]
         "Ioffset",          # Offset current
         "TauRefrac",        # Refractory time [ms]
-        "PoissonRate",      # Poisson input rate [Hz]
         "PoissonWeight",    # How much current each poisson spike adds [nA]
         "IpoissonTau"],     # Time constant of poisson spike integration [ms]],
-        
+
+    extra_global_params=[
+        ("PoissonExpMinusLambda", "scalar")],
+
     var_name_types=[("V","scalar"), ("RefracTime", "scalar"), ("Ipoisson", "scalar")],
     derived_params=[
         ("ExpTC",                   genn_model.create_dpf_class(lambda pars, dt: np.exp(-dt / pars[1]))()),
         ("Rmembrane",               genn_model.create_dpf_class(lambda pars, dt: pars[1] / pars[0])()),
-        ("PoissonExpMinusLambda",   genn_model.create_dpf_class(lambda pars, dt: np.exp(-(pars[7] / 1000.0) * dt))()),
-        ("IpoissonExpDecay",        genn_model.create_dpf_class(lambda pars, dt: np.exp(-dt / pars[9]))()),
-        ("IpoissonInit",            genn_model.create_dpf_class(lambda pars, dt: pars[8] * (1.0 - np.exp(-dt / pars[9])) * (pars[9] / dt))()),
+        ("IpoissonExpDecay",        genn_model.create_dpf_class(lambda pars, dt: np.exp(-dt / pars[8]))()),
+        ("IpoissonInit",            genn_model.create_dpf_class(lambda pars, dt: pars[7] * (1.0 - np.exp(-dt / pars[8])) * (pars[8] / dt))()),
     ],
-    
+
     sim_code="""
     scalar p = 1.0f;
     unsigned int numPoissonSpikes = 0;
@@ -84,7 +85,7 @@ lif_model = genn_model.create_custom_neuron_class(
     }
     $(Ipoisson) *= $(IpoissonExpDecay);
     """,
-    
+
     reset_code="""
     $(V) = $(Vreset);
     $(RefracTime) = $(TauRefrac);
@@ -242,9 +243,10 @@ class Simulation:
 
     def prepare(self):
         """
-        Prepare NEST Kernel.
+        Prepare GeNN model.
         """
-        self.model = genn_model.GeNNModel("float", "potjans_microcircuit")
+        self.model = genn_model.GeNNModel("float", "potjans_microcircuit",
+                                          code_gen_log_level=genn_wrapper.info)
         self.model.dT = self.params['dt']
         self.model._model.set_merge_postsynaptic_models(True)
         self.model.timing_enabled = self.params['timing_enabled']
@@ -261,18 +263,27 @@ class Simulation:
         max_ex_delay = self.network.params['delay_params']['delay_e'] + (ex_delay_sd * normal_quantile_cdf)
         max_in_delay = self.network.params['delay_params']['delay_i'] + (in_delay_sd * normal_quantile_cdf)
         
-        self.max_inter_area_delay_slots = int(round(max(max_ex_delay, max_in_delay) / self.params['dt']))
-        print("Max inter-area delay slots:%u" % self.max_inter_area_delay_slots)
-        """
-        #
-            
-        #for area_name in self.areas_simulated:
-            
-        else:
-            v = network.params['delay_params']['interarea_speed']
-            s = network.distances[target_area.name][source_area.name]
-            mean_delay = s / v
-        """
+        self.max_inter_area_delay = max(max_ex_delay, max_in_delay)
+        print("Max inter-area delay:%fms" % self.max_inter_area_delay)
+
+        # If we should create cortico-cortico connections
+        if not self.network.params['connection_params']['replace_cc']:
+            self.max_intra_area_delay = 0
+            for target_area in self.areas_simulated:
+                # Loop source area though complete list of areas
+                for source_area in self.network.area_list:
+                    if target_area != source_area:
+                        # If source_area is part of the simulated network,
+                        # connect it to target_area
+                        if source_area in self.areas_simulated:
+                            v = self.network.params['delay_params']['interarea_speed']
+                            s = self.network.distances[target_area][source_area]
+                            mean_delay = s / v
+
+                            delay_sd = mean_delay * self.network.params['delay_params']['delay_rel']
+                            self.max_intra_area_delay = max(self.max_intra_area_delay,
+                                                            mean_delay + (delay_sd * normal_quantile_cdf))
+            print("Max intra-area delay:%fms" % self.max_intra_area_delay)
 
     def create_areas(self):
         """
@@ -280,7 +291,6 @@ class Simulation:
         """
         self.areas = []
         for area_name in self.areas_simulated:
-            print(area_name)
             a = Area(self, self.network, area_name)
             self.areas.append(a)
 
@@ -491,14 +501,12 @@ class Area:
             assert neuron_params['neuron_model'] == 'iaf_psc_exp'
 
             pop_lif_params = deepcopy(lif_params)
-            
+
             mask = create_vector_mask(self.network.structure, areas=[self.name], pops=[pop])
             pop_lif_params['Ioffset'] = self.network.add_DC_drive[mask][0]
             if self.network.params['input_params']['poisson_input']:
-                pop_lif_params['PoissonRate'] = self.network.params['input_params']['rate_ext'] * self.external_synapses[pop]
                 pop_lif_params['PoissonWeight'] = self.network.W[self.name][pop]['external']['external']
                 pop_lif_params['IpoissonTau'] = neuron_params['single_neuron_dict']['tau_syn_ex']
-                    
             else:
                 K_ext = self.external_synapses[pop]
                 W_ext = self.network.W[self.name][pop]['external']['external']
@@ -506,16 +514,23 @@ class Area:
                 DC = K_ext * W_ext * tau_syn * 1.e-3 * \
                     self.network.params['rate_ext']
                 pop_lif_params['Ioffset'] += DC
-            
+
             # Use LIF model with Poisson input if poisson noise is used, otherwise standard LIF
             # **YUCK** really should use Poisson current source here
-            pop_model = lif_model if 'PoissonRate' in pop_lif_params else 'LIF'
-            
+            pop_model = lif_model if self.network.params['input_params']['poisson_input'] else 'LIF'
+
             # Create GeNN population
             genn_pop = self.simulation.model.add_neuron_population(self.name + '_' + pop, 
                                                                    int(self.neuron_numbers[pop]), 
                                                                    pop_model, pop_lif_params, lif_init)
             genn_pop.pop.set_spike_location(genn_wrapper.VarLocation_HOST_DEVICE)
+
+            # Set EGP containing lambda value for external input Poisson process
+            if self.network.params['input_params']['poisson_input']:
+                ext_input_rate = self.network.params['input_params']['rate_ext'] * self.external_synapses[pop]
+                genn_pop.add_extra_global_param("PoissonExpMinusLambda",
+                                                np.exp(-(ext_input_rate / 1000.0) * self.simulation.params['dt']))
+
             self.genn_pops[pop] = genn_pop
 
     def connect_populations(self):
@@ -656,8 +671,6 @@ def connect(simulation,
                              network.structure,
                              target_area.name,
                              source_area.name)
-    quantile = 0.9999
-    normal_quantile_cdf = norm.ppf(quantile)
 
     for target in target_area.populations:
         for source in source_area.populations:
@@ -668,11 +681,13 @@ def connect(simulation,
             exp_curr_params = {}
             
             if target_area == source_area:
+                max_delay = simulation.max_inter_area_delay
                 if 'E' in source:
                     mean_delay = network.params['delay_params']['delay_e']
                 elif 'I' in source:
                     mean_delay = network.params['delay_params']['delay_i']
             else:
+                max_delay = simulation.max_intra_area_delay
                 v = network.params['delay_params']['interarea_speed']
                 s = network.distances[target_area.name][source_area.name]
                 mean_delay = s / v
@@ -685,12 +700,10 @@ def connect(simulation,
                 syn_weight.update({'min': float(-np.finfo(np.float32).max), 'max': 0.})
             
             delay_sd = mean_delay * network.params['delay_params']['delay_rel']
-            max_delay = mean_delay + (delay_sd * normal_quantile_cdf)
-            if max_delay > 10.0:
-                print("ERROR: max delay %f" % max_delay)
+
             
             syn_delay = {'min': simulation.params['dt'],
-                         'max': 10.0,
+                         'max': max_delay,
                          'mean': mean_delay,
                          'sd': delay_sd}
             syn_spec = {'g': genn_model.init_var(normal_clipped_model, syn_weight),
@@ -705,14 +718,14 @@ def connect(simulation,
                 "StaticPulseDendriticDelay", {}, syn_spec, {}, {},
                 "ExpCurr", exp_curr_params, {},
                 genn_model.init_connectivity(fixed_num_total_with_replacement_model, conn_spec))
-            
+
             # Add extra global parameter with row lengths
             #syn_pop.add_connectivity_extra_global_param(
             #    'preCalcRowLength', build_row_lengths(source_genn_pop.size, target_genn_pop.size, num_sub_rows, num_connections))
-                                           
+
             # Set max dendritic delay and span type
-            syn_pop.pop.set_max_dendritic_delay_timesteps(100)
-            
+            syn_pop.pop.set_max_dendritic_delay_timesteps(int(round(max_delay / simulation.params['dt'])))
+
             if simulation.params['procedural_connectivity']:
                 syn_pop.pop.set_span_type(genn_wrapper.SynapseGroup.SpanType_PRESYNAPTIC)
                 syn_pop.pop.set_num_threads_per_spike(simulation.params['num_threads_per_spike'])

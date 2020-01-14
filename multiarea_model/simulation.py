@@ -30,6 +30,7 @@ from .default_params import check_custom_params
 from dicthash import dicthash
 from pygenn import genn_model, genn_wrapper
 from pygenn.genn_wrapper.FixedNumberTotalPreCalc import pre_calc_row_lengths, create_mt_19937
+from pygenn.genn_wrapper.CUDABackend import BlockSizeSelect_MANUAL, DeviceSelect_MANUAL
 from scipy.stats import norm
 from .multiarea_helpers import extract_area_dict, create_vector_mask
 try:
@@ -147,7 +148,10 @@ class Simulation:
         Prepare GeNN model.
         """
         self.model = genn_model.GeNNModel("float", "potjans_microcircuit",
-                                          code_gen_log_level=genn_wrapper.info)
+                                          code_gen_log_level=genn_wrapper.info,
+                                          useConstantCacheForMergedStructs=False,
+                                          deviceSelectMethod=DeviceSelect_MANUAL,
+                                          blockSizeSelectMethod=BlockSizeSelect_MANUAL)
         self.model.dT = self.params['dt']
         self.model._model.set_merge_postsynaptic_models(True)
         self.model.timing_enabled = self.params['timing_enabled']

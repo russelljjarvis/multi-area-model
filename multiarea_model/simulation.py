@@ -32,6 +32,7 @@ from pygenn import genn_model, genn_wrapper
 from pygenn.genn_wrapper.FixedNumberTotalPreCalc import pre_calc_row_lengths, create_mt_19937
 from pygenn.genn_wrapper.CUDABackend import BlockSizeSelect_MANUAL, DeviceSelect_MANUAL
 from scipy.stats import norm
+from six import iteritems, itervalues
 from .multiarea_helpers import extract_area_dict, create_vector_mask
 try:
     from .sumatra_helpers import register_runtime
@@ -315,12 +316,40 @@ class Simulation:
         self.time_genn_load = t5 - t4
         print("Loaded GeNN model in {0:.2f} seconds.".format(self.time_genn_load))
         
-        nest.Simulate(self.T)
+        # Loop through simulation time
+        while self.model.t < self.T:
+            # Step time
+            model.step_time()
+
+            # Loop through areas
+            for a in self.areas:
+                a.record()
+
         t6 = time.time()
         self.time_simulate = t6 - t5
         print("Simulated network in {0:.2f} seconds.".format(self.time_simulate))
+
+        # Write recorded data to disk
+        for a in self.areas:
+            a.write_recorded_data()
+
         self.logging()
 
+    def logging(self):
+        """
+        Write runtime to file.
+        """
+        d = {'time_prepare': self.time_prepare,
+                'time_network_local': self.time_network_local,
+                'time_network_global': self.time_network_global,
+                'time_simulate': self.time_simulate}
+        fn = os.path.join(self.data_dir,
+                            'recordings',
+                            '_'.join((self.label,
+                                    'logfile',
+                                    str(nest.Rank()))))
+        with open(fn, 'w') as f:
+            json.dump(d, f)
     def register_runtime(self):
         if sumatra_found:
             register_runtime(self.label)
@@ -406,6 +435,7 @@ class Area:
         poisson_init = {"current": 0.0}
 
         self.genn_pops = {}
+        self.spike_data = {}
         self.num_local_nodes = 0
         for pop in self.populations:
             assert neuron_params['neuron_model'] == 'iaf_psc_exp'
@@ -440,6 +470,7 @@ class Area:
 
             # Add population to dictionary
             self.genn_pops[pop] = genn_pop
+            self.spike_data[pop] = []
 
     def connect_populations(self):
         """
@@ -448,6 +479,39 @@ class Area:
         connect(self.simulation,
                 self,
                 self)
+
+    def record(self):
+        # If anything should be recorded from this area
+        # **YUCK** this is gonna be slow
+        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
+            # Loop through GeNN populations in area
+            for genn_pop in itervalues(self.genn_pops):
+                # Pull spikes from device
+                self.simulation.model.pull_current_spikes_from_device(genn_pop.name)
+
+                # Add copy of current spikes to list of this population's spike data
+                self.spike_data[pop].append(np.copy(genn_pop.current_spikes))
+
+    def write_recorded_data(self):
+        # Determine path for recorded data
+        recording_path = os.path.join(self.simulation.data_dir, 'recordings'),
+
+        timesteps = np.arange(0.0, self.simulation.T, self.simulation.params['dt'])
+
+        # If anything should be recorded from this area
+        # **YUCK** this is gonna be slow
+        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
+            for pop, data in iteritems(self.spike_data):
+                # Determine how many spikes were emitted in each timestep
+                spikes_per_timestep = [len(d) for d in data]
+                assert len(timesteps) == len(spikes_per_timestep)
+
+                # Repeat timesteps correct number of times to match number of spikes
+                spike_times = np.repeat(timesteps, spikes_per_timestep)
+                spike_ids = np.hstack(data)
+
+                # Write recorded data to disk
+                np.save(os.path.join(recording_path, self.name + "_" + pop.name + ".npy"), [spike_times, spike_ids])
 
     def create_additional_input(self, input_type, source_area_name, cc_input):
         """

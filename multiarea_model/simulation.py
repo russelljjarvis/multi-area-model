@@ -96,6 +96,7 @@ class Simulation:
         self.areas_simulated = self.params['areas_simulated']
         self.areas_recorded = self.params['recording_dict']['areas_recorded']
         self.T = self.params['t_sim']
+        self.extra_global_param_bytes = 0;
 
     def __eq__(self, other):
         # Two simulations are equal if the simulation parameters and
@@ -302,6 +303,8 @@ class Simulation:
         self.time_network_global = t3 - t2
         print("Created cortico-cortical connections in {0:.2f} seconds.".format(
             self.time_network_global))
+
+        print("Extra global parameters require: %u MB" % (self.extra_global_param_bytes / (1024 * 1024))
 
         if self.params['rebuild_model']:
             self.model.build()
@@ -659,6 +662,9 @@ def connect(simulation,
             syn_pop.add_connectivity_extra_global_param(
                 'preCalcRowLength', pre_calc_row_lengths(source_genn_pop.size, target_genn_pop.size,
                                                          num_connections, simulation.row_length_rng, num_sub_rows))
+
+            # Add size of this allocation to total
+            simulation.extra_global_param_bytes += source_genn_pop.size * num_sub_rows * 2
 
             # Set max dendritic delay and span type
             syn_pop.pop.set_max_dendritic_delay_timesteps(int(round(max_delay / simulation.params['dt'])))

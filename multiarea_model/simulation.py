@@ -443,14 +443,14 @@ class Area:
             pop_lif_params = deepcopy(lif_params)
 
             mask = create_vector_mask(self.network.structure, areas=[self.name], pops=[pop])
-            pop_lif_params['Ioffset'] = self.network.add_DC_drive[mask][0]
+            pop_lif_params['Ioffset'] = self.network.add_DC_drive[mask][0] / 1000.0
             if not self.network.params['input_params']['poisson_input']:
                 K_ext = self.external_synapses[pop]
                 W_ext = self.network.W[self.name][pop]['external']['external']
                 tau_syn = self.network.params['neuron_params']['single_neuron_dict']['tau_syn_ex']
                 DC = K_ext * W_ext * tau_syn * 1.e-3 * \
                     self.network.params['rate_ext']
-                pop_lif_params['Ioffset'] += DC
+                pop_lif_params['Ioffset'] += (DC / 1000.0)
 
             # Create GeNN population
             pop_name = self.name + '_' + pop
@@ -462,7 +462,7 @@ class Area:
             # If Poisson input is required
             if self.network.params['input_params']['poisson_input']:
                 # Add current source
-                poisson_params = {"weight": self.network.W[self.name][pop]['external']['external'],
+                poisson_params = {"weight": self.network.W[self.name][pop]['external']['external'] / 1000.0,
                                   "tauSyn": neuron_params['single_neuron_dict']['tau_syn_ex'],
                                   "rate": self.network.params['input_params']['rate_ext'] * self.external_synapses[pop]}
                 self.simulation.model.add_current_source(pop_name + "_poisson", "PoissonExp", pop_name,
@@ -613,7 +613,7 @@ def connect(simulation,
             num_connections = int(synapses[target][source])
             conn_spec = {"total": num_connections}
 
-            syn_weight = {"mean": W[target][source], "sd": W_sd[target][source]}
+            syn_weight = {"mean": W[target][source] / 1000.0, "sd": W_sd[target][source] / 1000.0}
             exp_curr_params = {}
             
             if target_area == source_area:

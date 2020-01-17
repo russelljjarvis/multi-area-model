@@ -304,7 +304,7 @@ class Simulation:
         print("Created cortico-cortical connections in {0:.2f} seconds.".format(
             self.time_network_global))
 
-        print("Extra global parameters require: %u MB" % (self.extra_global_param_bytes / (1024 * 1024))
+        print("Extra global parameters require: %u MB" % (self.extra_global_param_bytes / (1024 * 1024)))
 
         if self.params['rebuild_model']:
             self.model.build()

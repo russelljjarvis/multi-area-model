@@ -153,7 +153,8 @@ class Simulation:
                                           code_gen_log_level=genn_wrapper.info,
                                           useConstantCacheForMergedStructs=False,
                                           deviceSelectMethod=DeviceSelect_MANUAL,
-                                          blockSizeSelectMethod=BlockSizeSelect_MANUAL)
+                                          blockSizeSelectMethod=BlockSizeSelect_MANUAL,
+                                          selectGPUByDeviceID=True)
         self.model.dT = self.params['dt']
         self.model._model.set_merge_postsynaptic_models(True)
         self.model.timing_enabled = self.params['timing_enabled']

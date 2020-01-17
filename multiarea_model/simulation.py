@@ -332,6 +332,13 @@ class Simulation:
         self.time_simulate = t6 - t5
         print("Simulated network in {0:.2f} seconds.".format(self.time_simulate))
 
+        # If timing is enabled, read kernel timing from model
+        if self.params['timing_enabled']:
+            self.time_genn_init = 1000.0 * self.model.init_time
+            self.time_genn_init_sparse = 1000.0 * self.model.init_sparse_time
+            self.time_genn_neuron_update = 1000.0 * self.model.neuron_update_time
+            self.time_genn_presynaptic_update = 1000.0 * self.model.presynaptic_update_time
+
         # Write recorded data to disk
         for a in self.areas:
             a.write_recorded_data()
@@ -343,9 +350,16 @@ class Simulation:
         Write runtime to file.
         """
         d = {'time_prepare': self.time_prepare,
-                'time_network_local': self.time_network_local,
-                'time_network_global': self.time_network_global,
-                'time_simulate': self.time_simulate}
+             'time_network_local': self.time_network_local,
+             'time_network_global': self.time_network_global,
+             'time_simulate': self.time_simulate}
+
+        if self.params['timing_enabled']:
+            d.update({'time_genn_init': self.time_genn_init,
+                      'time_genn_init_sparse': self.time_genn_init_sparse,
+                      'time_genn_neuron_update': self.time_genn_neuron_update,
+                      'time_genn_presynaptic_update': self.time_genn_presynaptic_update})
+
         fn = os.path.join(self.data_dir,
                             'recordings',
                             '_'.join((self.label,

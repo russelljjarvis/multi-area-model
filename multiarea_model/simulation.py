@@ -323,7 +323,7 @@ class Simulation:
         # Loop through simulation time
         while self.model.t < self.T:
             # Step time
-            model.step_time()
+            self.model.step_time()
 
             # Loop through areas
             for a in self.areas:
@@ -361,11 +361,7 @@ class Simulation:
                       'time_genn_neuron_update': self.time_genn_neuron_update,
                       'time_genn_presynaptic_update': self.time_genn_presynaptic_update})
 
-        fn = os.path.join(self.data_dir,
-                            'recordings',
-                            '_'.join((self.label,
-                                    'logfile',
-                                    str(nest.Rank()))))
+        fn = os.path.join(self.data_dir, 'recordings','_'.join((self.label, 'logfile')))
         with open(fn, 'w') as f:
             json.dump(d, f)
     def register_runtime(self):
@@ -503,7 +499,7 @@ class Area:
         # **YUCK** this is gonna be slow
         if self.name in self.simulation.params['recording_dict']['areas_recorded']:
             # Loop through GeNN populations in area
-            for genn_pop in itervalues(self.genn_pops):
+            for pop, genn_pop in iteritems(self.genn_pops):
                 # Pull spikes from device
                 self.simulation.model.pull_current_spikes_from_device(genn_pop.name)
 
@@ -512,7 +508,7 @@ class Area:
 
     def write_recorded_data(self):
         # Determine path for recorded data
-        recording_path = os.path.join(self.simulation.data_dir, 'recordings'),
+        recording_path = os.path.join(self.simulation.data_dir, 'recordings')
 
         timesteps = np.arange(0.0, self.simulation.T, self.simulation.params['dt'])
 
@@ -529,7 +525,7 @@ class Area:
                 spike_ids = np.hstack(data)
 
                 # Write recorded data to disk
-                np.save(os.path.join(recording_path, self.name + "_" + pop.name + ".npy"), [spike_times, spike_ids])
+                np.save(os.path.join(recording_path, self.name + "_" + pop + ".npy"), [spike_times, spike_ids])
 
     def create_additional_input(self, input_type, source_area_name, cc_input):
         """

@@ -155,7 +155,8 @@ class Simulation:
                                           deviceSelectMethod=DeviceSelect_MANUAL,
                                           blockSizeSelectMethod=BlockSizeSelect_MANUAL,
                                           selectGPUByDeviceID=True,
-                                          generateEmptyStatePushPull=False)
+                                          generateEmptyStatePushPull=False,
+                                          generateExtraGlobalParamPull=False)
         self.model.dT = self.params['dt']
         self.model._model.set_merge_postsynaptic_models(True)
         self.model.timing_enabled = self.params['timing_enabled']

@@ -149,12 +149,13 @@ class Simulation:
         """
         Prepare GeNN model.
         """
-        self.model = genn_model.GeNNModel("float", "potjans_microcircuit",
+        self.model = genn_model.GeNNModel("float", "multi_area_model",
                                           code_gen_log_level=genn_wrapper.info,
                                           useConstantCacheForMergedStructs=False,
                                           deviceSelectMethod=DeviceSelect_MANUAL,
                                           blockSizeSelectMethod=BlockSizeSelect_MANUAL,
-                                          selectGPUByDeviceID=True)
+                                          selectGPUByDeviceID=True,
+                                          generateEmptyStatePushPull=False)
         self.model.dT = self.params['dt']
         self.model._model.set_merge_postsynaptic_models(True)
         self.model.timing_enabled = self.params['timing_enabled']

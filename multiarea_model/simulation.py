@@ -29,7 +29,6 @@ from .default_params import nested_update, sim_params
 from .default_params import check_custom_params
 from dicthash import dicthash
 from pygenn import genn_model, genn_wrapper
-from pygenn.genn_wrapper.FixedNumberTotalPreCalc import pre_calc_row_lengths, create_mt_19937
 from pygenn.genn_wrapper.CUDABackend import BlockSizeSelect_MANUAL, DeviceSelect_MANUAL
 from scipy.stats import norm
 from six import iteritems, itervalues
@@ -164,9 +163,6 @@ class Simulation:
         self.model.default_sparse_connectivity_location = genn_wrapper.VarLocation_DEVICE
         self.model._model.set_seed(self.params['master_seed'])
         
-        # Create RNG for drawing row lengths
-        self.row_length_rng = create_mt_19937(self.params['master_seed'])
-
         quantile = 0.9999
         normal_quantile_cdf = norm.ppf(quantile)
         
@@ -670,11 +666,6 @@ def connect(simulation,
                 "StaticPulseDendriticDelay", {}, syn_spec, {}, {},
                 "ExpCurr", exp_curr_params, {},
                 genn_model.init_connectivity("FixedNumberTotalWithReplacement", conn_spec))
-
-            # Add extra global parameter with row lengths
-            syn_pop.add_connectivity_extra_global_param(
-                'preCalcRowLength', pre_calc_row_lengths(source_genn_pop.size, target_genn_pop.size,
-                                                         num_connections, simulation.row_length_rng, num_sub_rows))
 
             # Add size of this allocation to total
             simulation.extra_global_param_bytes += source_genn_pop.size * num_sub_rows * 2

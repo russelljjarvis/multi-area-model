@@ -149,8 +149,7 @@ class Simulation:
         Prepare GeNN model.
         """
         self.model = genn_model.GeNNModel("float", "multi_area_model",
-                                          code_gen_log_level=genn_wrapper.info,
-                                          useConstantCacheForMergedStructs=False,
+                                          code_gen_log_level=genn_wrapper.info, 
                                           deviceSelectMethod=DeviceSelect_MANUAL,
                                           blockSizeSelectMethod=BlockSizeSelect_MANUAL,
                                           selectGPUByDeviceID=True,

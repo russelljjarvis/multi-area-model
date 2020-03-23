@@ -33,7 +33,7 @@ network_params = {'N_scaling': 1.,
                   'input_params': input_params,
                   'neuron_params': neuron_params}
 
-sim_params = {'t_sim': 2000.,
+sim_params = {'t_sim': 10500.,
               'num_processes': 720,
               'local_num_threads': 1,
               'recording_dict': {'record_vm': False}}

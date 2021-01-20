@@ -312,19 +312,14 @@ class Simulation:
         else:
             t4 = t3
            
-        self.model.load()
+        self.model.load(num_recording_timesteps=int(np.ceil(self.T / self.params['dt'])))
         t5 = time.time()
         self.time_genn_load = t5 - t4
         print("Loaded GeNN model in {0:.2f} seconds.".format(self.time_genn_load))
         
         # Loop through simulation time
         while self.model.t < self.T:
-            # Step time
             self.model.step_time()
-
-            # Loop through areas
-            for a in self.areas:
-                a.record()
 
         t6 = time.time()
         self.time_simulate = t6 - t5
@@ -337,6 +332,9 @@ class Simulation:
             self.time_genn_neuron_update = 1000.0 * self.model.neuron_update_time
             self.time_genn_presynaptic_update = 1000.0 * self.model.presynaptic_update_time
 
+        # Download recording data
+        self.model.pull_recording_buffers_from_device()
+        
         # Write recorded data to disk
         for a in self.areas:
             a.write_recorded_data()
@@ -468,7 +466,7 @@ class Area:
             genn_pop = self.simulation.model.add_neuron_population(pop_name, int(self.neuron_numbers[pop]),
                                                                    "LIF", pop_lif_params, lif_init)
 
-            genn_pop.pop.set_spike_location(genn_wrapper.VarLocation_HOST_DEVICE)
+            genn_pop.spike_recording_enabled = True
 
             # If Poisson input is required
             if self.network.params['input_params']['poisson_input']:
@@ -481,7 +479,6 @@ class Area:
 
             # Add population to dictionary
             self.genn_pops[pop] = genn_pop
-            self.spike_data[pop] = []
 
     def connect_populations(self):
         """
@@ -491,36 +488,17 @@ class Area:
                 self,
                 self)
 
-    def record(self):
+    def write_recorded_data(self):
+        # Determine path for recorded data
+        recording_path = os.path.join(self.simulation.data_dir, 'recordings')
+        
         # If anything should be recorded from this area
         # **YUCK** this is gonna be slow
         if self.name in self.simulation.params['recording_dict']['areas_recorded']:
             # Loop through GeNN populations in area
             for pop, genn_pop in iteritems(self.genn_pops):
-                # Pull spikes from device
-                self.simulation.model.pull_current_spikes_from_device(genn_pop.name)
-
-                # Add copy of current spikes to list of this population's spike data
-                self.spike_data[pop].append(np.copy(genn_pop.current_spikes))
-
-    def write_recorded_data(self):
-        # Determine path for recorded data
-        recording_path = os.path.join(self.simulation.data_dir, 'recordings')
-
-        timesteps = np.arange(0.0, self.simulation.T, self.simulation.params['dt'])
-
-        # If anything should be recorded from this area
-        # **YUCK** this is gonna be slow
-        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
-            for pop, data in iteritems(self.spike_data):
-                # Determine how many spikes were emitted in each timestep
-                spikes_per_timestep = [len(d) for d in data]
-                assert len(timesteps) == len(spikes_per_timestep)
-
-                # Repeat timesteps correct number of times to match number of spikes
-                spike_times = np.repeat(timesteps, spikes_per_timestep)
-                spike_ids = np.hstack(data)
-
+                spike_times, spike_ids = genn_pop.spike_recording_data
+                
                 # Write recorded data to disk
                 np.save(os.path.join(recording_path, self.name + "_" + pop + ".npy"), [spike_times, spike_ids])
 

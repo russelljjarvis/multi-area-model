@@ -154,7 +154,7 @@ class Simulation:
                                device_select_method=DeviceSelect.MANUAL,
                                block_size_select_method=BlockSizeSelect.MANUAL)
         self.model.dt = self.params['dt']
-        self.model.merge_postsynaptic_models = True
+        self.model.fuse_postsynaptic_models = True
         self.model.timing_enabled = self.params['timing_enabled']
         self.model.default_var_location = VarLocation.DEVICE
         self.model.default_sparse_connectivity_location = VarLocation.DEVICE

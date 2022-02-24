@@ -28,8 +28,9 @@ from copy import deepcopy
 from .default_params import nested_update, sim_params
 from .default_params import check_custom_params
 from dicthash import dicthash
-from pygenn import genn_model, genn_wrapper
-from pygenn.genn_wrapper.CUDABackend import BlockSizeSelect_MANUAL, DeviceSelect_MANUAL
+from pygenn import (GeNNModel, PlogSeverity, SpanType, VarLocation, 
+                    init_var, init_sparse_connectivity)
+from pygenn.cuda_backend import BlockSizeSelect, DeviceSelect
 from scipy.stats import norm
 from six import iteritems, itervalues
 from .multiarea_helpers import extract_area_dict, create_vector_mask
@@ -148,19 +149,16 @@ class Simulation:
         """
         Prepare GeNN model.
         """
-        self.model = genn_model.GeNNModel("float", "multi_area_model",
-                                          code_gen_log_level=genn_wrapper.info, 
-                                          deviceSelectMethod=DeviceSelect_MANUAL,
-                                          blockSizeSelectMethod=BlockSizeSelect_MANUAL,
-                                          selectGPUByDeviceID=True,
-                                          generateEmptyStatePushPull=False,
-                                          generateExtraGlobalParamPull=False)
-        self.model.dT = self.params['dt']
-        self.model._model.set_merge_postsynaptic_models(True)
+        self.model = GeNNModel("float", "multi_area_model",
+                               code_gen_log_level=PlogSeverity.INFO, 
+                               device_select_method=DeviceSelect.MANUAL,
+                               block_size_select_method=BlockSizeSelect.MANUAL)
+        self.model.dt = self.params['dt']
+        self.model.merge_postsynaptic_models = True
         self.model.timing_enabled = self.params['timing_enabled']
-        self.model.default_var_location = genn_wrapper.VarLocation_DEVICE
-        self.model.default_sparse_connectivity_location = genn_wrapper.VarLocation_DEVICE
-        self.model._model.set_seed(self.params['master_seed'])
+        self.model.default_var_location = VarLocation.DEVICE
+        self.model.default_sparse_connectivity_location = VarLocation.DEVICE
+        self.model.seed = self.params['master_seed']
         
         quantile = 0.9999
         normal_quantile_cdf = norm.ppf(quantile)
@@ -312,7 +310,7 @@ class Simulation:
         else:
             t4 = t3
            
-        self.model.load(num_recording_timesteps=int(np.ceil(self.T / self.params['dt'])))
+        self.model.load(num_recording_timesteps=self.params['recording_buffer_timesteps'])
         t5 = time.time()
         self.time_genn_load = t5 - t4
         print("Loaded GeNN model in {0:.2f} seconds.".format(self.time_genn_load))
@@ -320,6 +318,16 @@ class Simulation:
         # Loop through simulation time
         while self.model.t < self.T:
             self.model.step_time()
+            
+            # If recording buffer is full
+            if (self.model.timestep % self.params['recording_buffer_timesteps']) != 0:
+                # Download recording data
+                self.model.pull_recording_buffers_from_device()
+                
+                # Loop through areas
+                for a in self.areas:
+                    a.record()
+        
 
         t6 = time.time()
         self.time_simulate = t6 - t5
@@ -332,9 +340,6 @@ class Simulation:
             self.time_genn_neuron_update = 1000.0 * self.model.neuron_update_time
             self.time_genn_presynaptic_update = 1000.0 * self.model.presynaptic_update_time
 
-        # Download recording data
-        self.model.pull_recording_buffers_from_device()
-        
         # Write recorded data to disk
         for a in self.areas:
             a.write_recorded_data()
@@ -433,7 +438,7 @@ class Area:
         """
         neuron_params = self.network.params['neuron_params']
         v_init_params = {"mean": neuron_params['V0_mean'], "sd": neuron_params['V0_sd']}
-        lif_init = {"RefracTime": 0.0, "V": genn_model.init_var("Normal", v_init_params)}
+        lif_init = {"RefracTime": 0.0, "V": init_var("Normal", v_init_params)}
         lif_params = {"C": neuron_params['single_neuron_dict']['C_m'] / 1000.0, 
                       "TauM": neuron_params['single_neuron_dict']['tau_m'], 
                       "Vrest": neuron_params['single_neuron_dict']['E_L'], 
@@ -444,7 +449,8 @@ class Area:
         poisson_init = {"current": 0.0}
 
         self.genn_pops = {}
-        self.spike_data = {}
+        self.spike_times = {}
+        self.spike_ids = {}
         self.num_local_nodes = 0
         for pop in self.populations:
             assert neuron_params['neuron_model'] == 'iaf_psc_exp'
@@ -479,6 +485,8 @@ class Area:
 
             # Add population to dictionary
             self.genn_pops[pop] = genn_pop
+            self.spike_times[pop] = []
+            self.spike_ids[pop] = []
 
     def connect_populations(self):
         """
@@ -488,6 +496,19 @@ class Area:
                 self,
                 self)
 
+    def record(self):
+        # If anything should be recorded from this area
+        # **YUCK** this is gonna be slow
+        if self.name in self.simulation.params['recording_dict']['areas_recorded']:
+            # Loop through GeNN populations in area
+            for pop, genn_pop in iteritems(self.genn_pops):
+                # Extract spike recording data
+                spike_times, spike_ids = genn_pop.spike_recording_data
+
+                # Add spike times and ids to list
+                self.spike_times[pop].append(spike_times)
+                self.spike_ids[pop].append(spike_ids)
+        
     def write_recorded_data(self):
         # Determine path for recorded data
         recording_path = os.path.join(self.simulation.data_dir, 'recordings')
@@ -496,8 +517,10 @@ class Area:
         # **YUCK** this is gonna be slow
         if self.name in self.simulation.params['recording_dict']['areas_recorded']:
             # Loop through GeNN populations in area
-            for pop, genn_pop in iteritems(self.genn_pops):
-                spike_times, spike_ids = genn_pop.spike_recording_data
+            for pop in self.populations:
+                # Stack all spike times and IDs together
+                spike_times = np.hstack(self.spike_times[pop])
+                spike_ids = np.hstack(self.spike_ids[pop])
                 
                 # Write recorded data to disk
                 np.save(os.path.join(recording_path, self.name + "_" + pop + ".npy"), [spike_times, spike_ids])
@@ -631,25 +654,25 @@ def connect(simulation,
                          'max': max_delay,
                          'mean': mean_delay,
                          'sd': delay_sd}
-            syn_spec = {'g': genn_model.init_var("NormalClipped", syn_weight),
-                        'd': genn_model.init_var("NormalClippedDelay", syn_delay)}
+            syn_spec = {'g': init_var("NormalClipped", syn_weight),
+                        'd': init_var("NormalClippedDelay", syn_delay)}
 
             # Add synapse population
             source_genn_pop = source_area.genn_pops[source]
             target_genn_pop = target_area.genn_pops[target]
             syn_pop = simulation.model.add_synapse_population(source_genn_pop.name + "_" + target_genn_pop.name, 
-                matrix_type, genn_wrapper.NO_DELAY,
+                matrix_type, 0,
                 source_genn_pop, target_genn_pop,
                 "StaticPulseDendriticDelay", {}, syn_spec, {}, {},
                 "ExpCurr", exp_curr_params, {},
-                genn_model.init_connectivity("FixedNumberTotalWithReplacement", conn_spec))
+                init_sparse_connectivity("FixedNumberTotalWithReplacement", conn_spec))
 
             # Add size of this allocation to total
             simulation.extra_global_param_bytes += source_genn_pop.size * num_sub_rows * 2
 
             # Set max dendritic delay and span type
-            syn_pop.pop.set_max_dendritic_delay_timesteps(int(round(max_delay / simulation.params['dt'])))
+            syn_pop.max_dendritic_delay_timesteps = int(round(max_delay / simulation.params['dt']))
 
             if simulation.params['procedural_connectivity']:
-                syn_pop.pop.set_span_type(genn_wrapper.SynapseGroup.SpanType_PRESYNAPTIC)
-                syn_pop.pop.set_num_threads_per_spike(simulation.params['num_threads_per_spike'])
+                syn_pop.span_type = SpanType.PRESYNAPTIC
+                syn_pop.num_threads_per_spike = simulation.params['num_threads_per_spike']
